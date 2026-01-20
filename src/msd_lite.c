@@ -72,6 +72,7 @@
 #include "utils/sys_res_limits_xml.h"
 #include "msd_lite_stat_text.h"
 #include "msd_lite_stat_json.h"
+#include "utils/base64.h"
 
 
 
@@ -210,7 +211,7 @@ msd_hub_profile_load(const uint8_t *data, size_t data_size, str_hub_settings_p p
 	    (const uint8_t*)"fSocketTCPNoPush", NULL)) {
 		yn_set_flag32(ptm, tm, STR_HUB_S_F_SKT_TCP_NOPUSH, &params->flags);
 	}
-	
+
 	xml_get_val_size_t_args(data, data_size, NULL, &params->ring_buf_size,
 	    (const uint8_t*)"ringBufSize", NULL);
 	xml_get_val_size_t_args(data, data_size, NULL, &params->precache,
@@ -276,30 +277,94 @@ msd_src_conn_profile_load(const uint8_t *data, size_t data_size, void *conn) {
 	return (0);
 }
 
-static void
-base64_encode(const uint8_t *src, size_t len, uint8_t *dst) {
-	static const char b64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-	while (len >= 3) {
-		*dst++ = b64[src[0] >> 2];
-		*dst++ = b64[((src[0] & 0x03) << 4) | (src[1] >> 4)];
-		*dst++ = b64[((src[1] & 0x0F) << 2) | (src[2] >> 6)];
-		*dst++ = b64[src[2] & 0x3F];
-		src += 3; len -= 3;
+int
+generate_basic_auth(const char *user, const char *pass,
+	uint8_t **auth_out, size_t *auth_len_out) {
+	if (!user || !pass || !auth_out || !auth_len_out) {
+		return EINVAL;
 	}
-	if (len > 0) {
-		*dst++ = b64[src[0] >> 2];
-		if (len == 1) {
-			*dst++ = b64[(src[0] & 0x03) << 4];
-			*dst++ = '=';
-		} else {
-			*dst++ = b64[((src[0] & 0x03) << 4) | (src[1] >> 4)];
-			*dst++ = b64[(src[1] & 0x0F) << 2];
-		}
-		*dst++ = '=';
+
+	size_t user_len = strlen(user);
+	size_t pass_len = strlen(pass);
+	size_t up_len = user_len + 1 + pass_len;
+	uint8_t *up_buf = malloc(up_len);
+	if (!up_buf) {
+		return ENOMEM;
 	}
-	*dst = 0;
+	memcpy(up_buf, user, user_len);
+	up_buf[user_len] = ':';
+	memcpy(up_buf + user_len + 1, pass, pass_len);
+
+	size_t b64_len;
+	int error = base64_encode(up_buf, up_len, NULL, 0, &b64_len);
+	if (error != ENOBUFS) {
+	free(up_buf);
+		return error;
+	}
+
+	uint8_t *b64_buf = malloc(b64_len + 1);
+	if (!b64_buf) {
+		free(up_buf);
+		return ENOMEM;
+	}
+
+	error = base64_encode(up_buf, up_len, b64_buf, b64_len + 1, &b64_len);
+	if (error != 0) {
+		free(up_buf);
+		free(b64_buf);
+		return error;
+	}
+	b64_buf[b64_len] = '\0';
+
+	*auth_out = b64_buf;
+	*auth_len_out = b64_len;
+	free(up_buf);
+	return 0;
 }
 
+
+static int
+msd_check_basic_auth(http_srv_req_p req, http_srv_resp_p resp) {
+	if (!g_data.admin_auth_basic || g_data.admin_auth_basic_size == 0) {
+		return 0;
+	}
+
+	const uint8_t *auth_val;
+	size_t auth_val_len;
+	static const uint8_t auth_hdr_name[] = "Authorization";
+	static const uint8_t basic_prefix[] = "Basic ";
+	static const char *auth_fail_hdrs = "WWW-Authenticate: Basic realm=\"MSD Lite Admin\"\r\n";
+	const size_t auth_hdr_name_len = sizeof(auth_hdr_name) - 1;
+	const size_t basic_prefix_len = sizeof(basic_prefix) - 1;
+	const size_t auth_fail_hdrs_len = strlen(auth_fail_hdrs);
+
+	int error = http_hdr_val_get(req->hdr, req->hdr_size,
+	                            auth_hdr_name, auth_hdr_name_len,
+	                            &auth_val, &auth_val_len);
+	if (error != 0) {
+		goto auth_fail;
+	}
+
+	if (auth_val_len < basic_prefix_len ||
+		memcmp(auth_val, basic_prefix, basic_prefix_len) != 0) {
+		goto auth_fail;
+	}
+
+	const uint8_t *b64_val = auth_val + basic_prefix_len;
+	const size_t b64_val_len = auth_val_len - basic_prefix_len;
+	if (b64_val_len != g_data.admin_auth_basic_size ||
+		memcmp(b64_val, g_data.admin_auth_basic, b64_val_len) != 0) {
+		goto auth_fail;
+	}
+	return 0;
+
+	auth_fail:
+		resp->status_code = 401;
+		resp->hdrs_count = 1;
+		resp->hdrs[0].iov_base = MK_RW_PTR(auth_fail_hdrs);
+		resp->hdrs[0].iov_len = auth_fail_hdrs_len;
+	return 1;
+}
 
 
 int
@@ -429,27 +494,30 @@ main(int argc, char *argv[]) {
 	{
 		const uint8_t *adm_user = NULL, *adm_pass = NULL;
 		size_t adm_user_len = 0, adm_pass_len = 0;
-		
+
 		MSD_CFG_GET_VAL_DATA(NULL, &adm_user, &adm_user_len, "admin", "user", NULL);
 		MSD_CFG_GET_VAL_DATA(NULL, &adm_pass, &adm_pass_len, "admin", "password", NULL);
-		
+
 		if (adm_user && adm_pass && adm_user_len > 0 && adm_pass_len > 0) {
-			size_t up_len = adm_user_len + 1 + adm_pass_len;
-			uint8_t *up_buf = malloc(up_len + 1);
-			if (up_buf) {
-				memcpy(up_buf, adm_user, adm_user_len);
-				up_buf[adm_user_len] = ':';
-				memcpy(up_buf + adm_user_len + 1, adm_pass, adm_pass_len);
-				up_buf[up_len] = 0;
-				
-				size_t b64_len = ((up_len + 2) / 3) * 4;
-				g_data.admin_auth_basic = malloc(b64_len + 1);
-				if (g_data.admin_auth_basic) {
-					base64_encode(up_buf, up_len, g_data.admin_auth_basic);
-					g_data.admin_auth_basic_size = b64_len;
-					syslog(LOG_NOTICE, "Admin Basic Auth enabled.");
+			char *user_str = malloc(adm_user_len + 1);
+			char *pass_str = malloc(adm_pass_len + 1);
+			if (user_str && pass_str) {
+				memcpy(user_str, adm_user, adm_user_len);
+				user_str[adm_user_len] = '\0';
+				memcpy(pass_str, adm_pass, adm_pass_len);
+				pass_str[adm_pass_len] = '\0';
+
+				int ret = generate_basic_auth(user_str, pass_str,
+			                                 &g_data.admin_auth_basic,
+			                                 &g_data.admin_auth_basic_size);
+				if (ret == 0) {
+				        syslog(LOG_NOTICE, "Admin Basic Auth enabled.");
+				} else {
+				        syslog(LOG_ERR, "Failed to generate basic auth: %d", ret);
 				}
-				free(up_buf);
+
+				free(user_str);
+				free(pass_str);
 			}
 		}
 	}
@@ -597,7 +665,7 @@ msd_http_req_url_parse(http_srv_req_p req, struct sockaddr_storage *ssaddr,
 		ifname[tm] = 0;
 		ifindex = if_nametoindex(ifname);
 	} else {
-		if (0 == http_query_val_get(req->line.query, 
+		if (0 == http_query_val_get(req->line.query,
 		    req->line.query_size, (const uint8_t*)"ifindex", 7,
 		    &ptm, &tm)) {
 			ifindex = ustr2u32(ptm, tm);
@@ -613,7 +681,7 @@ msd_http_req_url_parse(http_srv_req_p req, struct sockaddr_storage *ssaddr,
 	}
 
 	/* rejoin_time. */
-	if (0 == http_query_val_get(req->line.query, 
+	if (0 == http_query_val_get(req->line.query,
 	    req->line.query_size, (const uint8_t*)"rejoin_time", 11,
 	    &ptm, &tm)) {
 		rejointime = ustr2u32(ptm, tm);
@@ -705,22 +773,14 @@ msd_http_srv_on_req_rcv_cb(http_srv_cli_p cli, void *udata __unused,
 	/* JSON Statistic request. */
 	if (HTTP_REQ_METHOD_GET == req->line.method_code &&
 	    0 == mem_cmpin_cstr("/api/stats", req->line.abs_path, req->line.abs_path_size)) {
-		
+
 		/* Auth Check */
-		if (g_data.admin_auth_basic) {
-			const uint8_t *val;
-			size_t val_len;
-			if (0 != http_hdr_val_get(req->hdr, req->hdr_size, (const uint8_t*)"Authorization", 13, &val, &val_len) ||
-			    val_len < 6 || 
-			    0 != memcmp(val, "Basic ", 6) ||
-			    val_len - 6 != g_data.admin_auth_basic_size ||
-			    0 != memcmp(val + 6, g_data.admin_auth_basic, g_data.admin_auth_basic_size)) {
-				resp->status_code = 401;
-				resp->hdrs_count = 1;
-				resp->hdrs[0].iov_base = MK_RW_PTR(auth_fail_hdrs);
-				resp->hdrs[0].iov_len = 46;
-				return (HTTP_SRV_CB_CONTINUE);
-			}
+		int auth_result = msd_check_basic_auth(req, resp);
+		if (auth_result == 1) {
+			return (HTTP_SRV_CB_CONTINUE);
+		} else if (auth_result == -1) {
+			resp->status_code = 500;
+			return (HTTP_SRV_CB_CONTINUE);
 		}
 
 		error = gen_hub_stat_json_send_async(g_data.shbskt, cli);
@@ -735,22 +795,14 @@ msd_http_srv_on_req_rcv_cb(http_srv_cli_p cli, void *udata __unused,
 	/* Admin page request. */
 	if (HTTP_REQ_METHOD_GET == req->line.method_code &&
 	    0 == mem_cmpin_cstr("/admin", req->line.abs_path, req->line.abs_path_size)) {
-		
+
 		/* Auth Check */
-		if (g_data.admin_auth_basic) {
-			const uint8_t *val;
-			size_t val_len;
-			if (0 != http_hdr_val_get(req->hdr, req->hdr_size, (const uint8_t*)"Authorization", 13, &val, &val_len) ||
-			    val_len < 6 || 
-			    0 != memcmp(val, "Basic ", 6) ||
-			    val_len - 6 != g_data.admin_auth_basic_size ||
-			    0 != memcmp(val + 6, g_data.admin_auth_basic, g_data.admin_auth_basic_size)) {
-				resp->status_code = 401;
-				resp->hdrs_count = 1;
-				resp->hdrs[0].iov_base = MK_RW_PTR(auth_fail_hdrs);
-				resp->hdrs[0].iov_len = 46;
-				return (HTTP_SRV_CB_CONTINUE);
-			}
+		int auth_result = msd_check_basic_auth(req, resp);
+		if (auth_result == 1) {
+			return (HTTP_SRV_CB_CONTINUE);
+		} else if (auth_result == -1) {
+			resp->status_code = 500;
+			return (HTTP_SRV_CB_CONTINUE);
 		}
 
 		error = gen_admin_page(cli);

@@ -72,15 +72,28 @@ static void	gen_hub_stat_json_enum_done_cb(tpt_p tpt, size_t send_msg_cnt,
 /* Helper to escape JSON strings */
 static void
 json_escape_str(io_buf_p buf, const char *str) {
-	while (*str) {
-		if (*str == '"') io_buf_printf(buf, "\\\"");
-		else if (*str == '\\') io_buf_printf(buf, "\\\\");
-		else if (*str == '\b') io_buf_printf(buf, "\\b");
-		else if (*str == '\f') io_buf_printf(buf, "\\f");
-		else if (*str == '\n') io_buf_printf(buf, "\\n");
-		else if (*str == '\r') io_buf_printf(buf, "\\r");
-		else if (*str == '\t') io_buf_printf(buf, "\\t");
-		else io_buf_printf(buf, "%c", *str);
+	if (NULL == buf || NULL == str) {
+		return;
+	}
+	while (*str != '\0') {
+		unsigned char c = (unsigned char)*str;
+		switch (c) {
+			case '"':  io_buf_printf(buf, "\\\"");  break;
+			case '\\': io_buf_printf(buf, "\\\\");  break;
+			case '\b': io_buf_printf(buf, "\\b");   break;  // 0x08
+			case '\f': io_buf_printf(buf, "\\f");   break;  // 0x0C
+			case '\n': io_buf_printf(buf, "\\n");   break;  // 0x0A
+			case '\r': io_buf_printf(buf, "\\r");   break;  // 0x0D
+			case '\t': io_buf_printf(buf, "\\t");   break;  // 0x09
+			case '\0' ... '\x07':    // 0x00-0x07
+			case '\x0B':             // 0x0B
+			case '\x0E' ... '\x1F':  // 0x0E-0x1F
+				io_buf_printf(buf, "\\u%04x", c);
+				break;
+		default:
+				io_buf_printf(buf, "%c", c);
+				break;
+		}
 		str++;
 	}
 }
@@ -93,7 +106,7 @@ gen_hub_stat_json_send_async(str_hubs_bckt_p shbskt, http_srv_cli_p cli) {
 	io_buf_p buf;
 	json_enum_ctx_p ctx;
 	struct rusage ru;
-	
+
 	/* Allocate context for callback */
 	ctx = malloc(sizeof(json_enum_ctx_t));
 	if (NULL == ctx) return (ENOMEM);
@@ -116,27 +129,27 @@ gen_hub_stat_json_send_async(str_hubs_bckt_p shbskt, http_srv_cli_p cli) {
 		free(ctx);
 		return (error);
 	}
-	
+
 	buf = http_srv_cli_get_buf(cli);
 
 	/* Start JSON output */
 	io_buf_printf(buf, "{\n");
-	
+
 	/* System Stats */
 	io_buf_printf(buf, "  \"system\": {\n");
-	
+
 	/* CPU / RAM (Simple approximation using getrusage) */
 	if (getrusage(RUSAGE_SELF, &ru) == 0) {
 		/* User + Sys time in seconds (not percentage, but useful) */
-		/* To get percentage we need delta, which is hard here without state. 
-		   For now, let's just output usage stats. 
+		/* To get percentage we need delta, which is hard here without state.
+		   For now, let's just output usage stats.
 		   Or we can try to read /proc/stat if on Linux, but let's stick to portable-ish.
 		   Actually, let's just output what we have. */
 		io_buf_printf(buf, "    \"cpu_user_sec\": %ld,\n", ru.ru_utime.tv_sec);
 		io_buf_printf(buf, "    \"cpu_sys_sec\": %ld,\n", ru.ru_stime.tv_sec);
 		io_buf_printf(buf, "    \"ram_used\": %ld,\n", ru.ru_maxrss * 1024); /* maxrss is usually KB */
 	}
-	
+
 	/* We can try to get total RAM from sysconf */
 #ifdef _SC_PHYS_PAGES
 	long pages = sysconf(_SC_PHYS_PAGES);
@@ -150,37 +163,37 @@ gen_hub_stat_json_send_async(str_hubs_bckt_p shbskt, http_srv_cli_p cli) {
 	io_buf_printf(buf, "    \"rate_in\": %"PRIu64",\n", hstat.baud_rate_in);
 	io_buf_printf(buf, "    \"rate_out\": %"PRIu64",\n", hstat.baud_rate_out);
 	io_buf_printf(buf, "    \"total_clients\": %zu,\n", hstat.cli_count);
-	
+
 	/* Uptime */
 	struct timespec ts;
 	if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
 		io_buf_printf(buf, "    \"uptime_sec\": %ld,\n", ts.tv_sec);
 		char str_time[64];
-		time_t uptime = ts.tv_sec; // Approximate since boot of app if using monotonic from 0? 
+		time_t uptime = ts.tv_sec; // Approximate since boot of app if using monotonic from 0?
 		// Actually gettime_monotonic() in this codebase might be different.
 		// Let's use the one from utils/sys.h if available, or just CLOCK_MONOTONIC
 		fmt_as_uptime(&uptime, str_time, sizeof(str_time));
 		io_buf_printf(buf, "    \"uptime\": \"%s\",\n", str_time);
 	}
-	
-	/* CPU Usage Hack: 
-	   Since we can't easily calculate % without history, we'll send a dummy value or 
-	   rely on the client to calculate delta if we sent counters. 
-	   But the user asked for "Realtime CPU". 
-	   Let's just put a placeholder or 0 if we can't get it easily. 
+
+	/* CPU Usage Hack:
+	   Since we can't easily calculate % without history, we'll send a dummy value or
+	   rely on the client to calculate delta if we sent counters.
+	   But the user asked for "Realtime CPU".
+	   Let's just put a placeholder or 0 if we can't get it easily.
 	   The text stat uses info_sysres which might print it.
 	*/
-	io_buf_printf(buf, "    \"cpu_usage\": 0\n"); 
-	
+	io_buf_printf(buf, "    \"cpu_usage\": 0\n");
+
 	io_buf_printf(buf, "  },\n"); // End system
 
 	/* Hubs Array */
 	io_buf_printf(buf, "  \"hubs\": [\n");
 
 	/* Pass ctx to callback */
-	/* We need to attach ctx to cli or pass it through. 
+	/* We need to attach ctx to cli or pass it through.
 	   The enum function takes `void *udata`. We pass ctx there. */
-	
+
 	error = str_hubs_bckt_enum(shbskt, gen_hub_stat_json_entry_enum_cb, ctx,
 	    gen_hub_stat_json_enum_done_cb);
 
@@ -210,10 +223,10 @@ gen_hub_stat_json_entry_enum_cb(tpt_p tpt, str_hub_p str_hub, void *udata) {
 	io_buf_printf(buf, "      \"name\": \"");
 	json_escape_str(buf, str_hub->name);
 	io_buf_printf(buf, "\",\n");
-	
+
 	io_buf_printf(buf, "      \"rate_in\": %"PRIu64",\n", str_hub->baud_rate_in);
 	io_buf_printf(buf, "      \"dropped_count\": %"PRIu64",\n", str_hub->dropped_count);
-	
+
 	/* Source Info */
 	conn_mc = &str_hub->src_conn_params.mc;
 	if (0 != sa_addr_port_to_str(&conn_mc->udp.addr, straddr,
@@ -222,12 +235,12 @@ gen_hub_stat_json_entry_enum_cb(tpt_p tpt, str_hub_p str_hub, void *udata) {
 	}
 	ifname[0] = 0;
 	if_indextoname(conn_mc->if_index, ifname);
-	
+
 	io_buf_printf(buf, "      \"source\": \"%s@%s\",\n", straddr, ifname);
 
 	/* Clients */
 	io_buf_printf(buf, "      \"clients\": [\n");
-	
+
 	TAILQ_FOREACH_SAFE(strh_cli, &str_hub->cli_head, next, strh_cli_temp) {
 		if (!first_cli) {
 			io_buf_printf(buf, ",\n");
@@ -238,7 +251,7 @@ gen_hub_stat_json_entry_enum_cb(tpt_p tpt, str_hub_p str_hub, void *udata) {
 		    straddr, sizeof(straddr), NULL)) {
 			memcpy(straddr, "unknown", 8);
 		}
-		
+
 		time_conn = (cur_time - strh_cli->conn_time);
 		fmt_as_uptime(&time_conn, str_time, sizeof(str_time));
 
@@ -252,7 +265,7 @@ gen_hub_stat_json_entry_enum_cb(tpt_p tpt, str_hub_p str_hub, void *udata) {
 		io_buf_printf(buf, "          \"time\": \"%s\"\n", str_time);
 		io_buf_printf(buf, "        }");
 	}
-	
+
 	io_buf_printf(buf, "\n      ]\n"); // End clients
 	io_buf_printf(buf, "    }"); // End hub
 }
@@ -285,7 +298,7 @@ gen_hub_stat_json_enum_done_cb(tpt_p tpt __unused, size_t send_msg_cnt __unused,
 }
 
 /* Admin Page HTML */
-static const char *admin_html = 
+static const char *admin_html =
 "<!DOCTYPE html>"
 "<html lang=\"en\">"
 "<head>"
