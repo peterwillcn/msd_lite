@@ -71,6 +71,7 @@
 #include "utils/cmd_line_daemon.h"
 #include "utils/sys_res_limits_xml.h"
 #include "msd_lite_stat_text.h"
+#include "msd_lite_stat_json.h"
 
 
 
@@ -641,6 +642,28 @@ msd_http_srv_on_req_rcv_cb(http_srv_cli_p cli, void *udata __unused,
 		}
 		/* Will send reply later... */
 		return (HTTP_SRV_CB_NONE);
+	}
+
+	/* JSON Statistic request. */
+	if (HTTP_REQ_METHOD_GET == req->line.method_code &&
+	    0 == mem_cmpin_cstr("/api/stats", req->line.abs_path, req->line.abs_path_size)) {
+		error = gen_hub_stat_json_send_async(g_data.shbskt, cli);
+		if (0 != error) {
+			resp->status_code = 500;
+			return (HTTP_SRV_CB_CONTINUE);
+		}
+		/* Will send reply later... */
+		return (HTTP_SRV_CB_NONE);
+	}
+
+	/* Admin page request. */
+	if (HTTP_REQ_METHOD_GET == req->line.method_code &&
+	    0 == mem_cmpin_cstr("/admin", req->line.abs_path, req->line.abs_path_size)) {
+		error = gen_admin_page(cli);
+		if (0 != error) {
+			resp->status_code = 500;
+		}
+		return (HTTP_SRV_CB_CONTINUE);
 	}
 
 	if (12 < req->line.abs_path_size &&
